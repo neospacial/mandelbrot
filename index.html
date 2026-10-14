@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mandelbrot zoom v1.6.0</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+    background: #12002b;
+    touch-action: none;          /* no pinch zoom or double-tap zoom; a tap changes the palette */
+    -webkit-tap-highlight-color: transparent;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  body.idle { cursor: none; }
+  #msg {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-items: center;
+    padding: 2rem;
+    color: #ff6ae8;
+    font: 1rem/1.5 system-ui, sans-serif;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+<canvas id="c" role="img" aria-label="Animated zoom into the Mandelbrot set"></canvas>
+<div id="msg" role="status"></div>
+
+<script>
+/*
+  Mandelbrot zoom v1.6.0 — fully offline, no network calls.
+
+  Click or tap the page to change the color palette. The order is:
+  neon, sunset, black and white, neon inverted, sunset inverted,
+  black and white inverted, then back to neon.
+
+  How the zoom continues forever:
+  - The camera zooms toward a Misiurewicz point c0 (preperiod 14, period 4).
+  - Near c0 the set is self-similar: zoom in by |rho| and turn by arg(rho),
+    and the image repeats. rho is the multiplier of the repelling 4-cycle.
+  - Pixels are computed with perturbation theory against the exact
+    (pre)periodic reference orbit of c0, so float32 on the GPU stays accurate
+    far below normal float32 limits.
+  - When the zoom reaches the self-similar depth band, the phase steps back by
+    LOOP_CYCLES cycles. The image before and after that step is the same, so
+    the reset is not visible and depth never runs out of precision.
+
+  Camera rotation:
+  - The camera always turns by arg(rho) each cycle, because the self-similarity
+    includes that turn. SPIN_TURNS adds more rotation on top of it.
+  - The added rotation must be a whole number of turns across the loop band,
+    or the reset becomes visible. Thus SPIN_TURNS must stay a whole number.
+    Set it to 0 for no added rotation. A negative value turns the camera in the
+    same direction as the natural turn of the spiral.
+
+  Efficiency (v1.3.0):
+  - Series approximation: for the first N iterations, every pixel stays close
+    to the reference orbit, so d_N = a*w + b*w^2 + c*w^3 (w = pixel offset).
+    The CPU calculates a, b, c once per frame. The GPU skips N iterations
+    (about 4 per zoom cycle: 32 at the start of the loop band, 56 at the end).
+  - The derivative is kept in pixel units, not in set units. In set units it
+    grew past the float32 limit in the deep half of the loop band, and the
+    image became white stripes.
+  - The two palettes of a cross-fade are mixed on the CPU. The shader colors
+    each pixel one time.
+  - Frame cap: on displays faster than about 105 Hz, the page draws on every
+    second (or third) refresh, not on every refresh.
+
+  Intro and resolution (v1.4.0):
+  - The intro (phase 1.5 to 3.5, about 10 s to 24 s) passes the small bulbs of
+    Seahorse Valley and costs up to 3x the loop band per frame.
+  - At start, the page times the fractal pass on this GPU at 20 points of the
+    zoom (offscreen, quarter size, about 0.25 s on a dark screen).
+  - Each frame, the render size comes from that timing: the size goes down a
+    short time before a heavy part, and comes back after it. A feedback factor
+    from the measured frame times corrects the plan.
+  - Renders below full size go to an offscreen texture and are scaled up to the
+    canvas. The canvas keeps its size, so size changes cause no frame hitch.
+
+  Smooth edges in the intro (v1.5.0):
+  - Next to the big cardioid and bulbs (about 6 s to 16 s), many exterior points
+    need more than MAX_ITER iterations to escape. Before, they were drawn in the
+    interior color, mixed at random with lit neighbors: a fuzzy, noisy edge.
+  - Now a point that does not escape uses 1/|dz| as an approximate distance to
+    the set. Inside a bulb dz stays small (dark); just outside it grows very large
+    (filament color). The edge is a smooth line. Deep phases do not change.
+
+  Robustness (v1.6.0):
+  - A resize redraws at once (a canvas resize clears it: before, a black frame).
+  - The canvas has a pixel cap and a side cap from the GPU limits, and the page
+    draws with the real drawing-buffer size (a very wide screen got an off-center,
+    cropped image). The offscreen texture is freed after 10 s without use.
+  - After a context loss, the page builds everything again and times the new GPU.
+    If no restore comes, a message tells the user to reload.
+  - Taps: one finger, small movement, short press. Keys: no repeat, no shortcuts.
+  - Derivative overflow check that fast-math compilers cannot remove.
+*/
+
+const C0 = [-0.7410964787817876, 0.1895294145054434];
+const K = 14, P = 4, L = K + P;
+const S0 = 1.5;               // half of the short screen side at the start, in set units
+const EFOLDS_PER_SEC = 0.30;  // zoom speed
+const LOOP_START = 9;         // phase where the self-similar loop band starts
+const LOOP_CYCLES = 6;        // length of the loop band, in self-similar cycles
+const SPIN_TURNS = -1;        // whole turns added across the loop band
+const MAX_ITER = 1200;
+const BULB_TEST_SCALE = 1e-3; // test the main cardioid and 2-bulb while the view is larger than this
+
+// Reference orbit Z_0 .. Z_{L-1}. After index L-1 the orbit repeats with period P.
+const orbit = [];
+{
+  let zr = 0, zi = 0;
+  for (let n = 0; n < L; n++) {
+    orbit.push([zr, zi]);
+    const nr = zr * zr - zi * zi + C0[0];
+    zi = 2 * zr * zi + C0[1];
+    zr = nr;
+  }
+}
+// Reference index after n iterations.
+const refIndex = (n) => (n < L ? n : K + ((n - K) % P));
+
+// Cycle multiplier rho = product of 2*Z_j over the cycle.
+let rhoR = 1, rhoI = 0;
+for (let j = K; j < L; j++) {
+  const a = 2 * orbit[j][0], b = 2 * orbit[j][1];
+  const r = rhoR * a - rhoI * b, i = rhoR * b + rhoI * a;
+  rhoR = r; rhoI = i;
+}
+const RHO_ABS = Math.hypot(rhoR, rhoI);
+const RHO_ARG = Math.atan2(rhoI, rhoR);
+
+// Camera angle per unit of phase: the turn the self-similarity needs, plus the added spin.
+const ANGLE_PER_PHASE = -RHO_ARG + 2 * Math.PI * Math.round(SPIN_TURNS) / LOOP_CYCLES;
+
+// Half speed when the system asks for reduced motion. The page follows a change of that setting.
+const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+let PHASE_PER_SEC = 0;
+function updateSpeed() { PHASE_PER_SEC = (motionQuery.matches ? 0.5 : 1) * EFOLDS_PER_SEC / Math.log(RHO_ABS); }
+updateSpeed();
+if (motionQuery.addEventListener) motionQuery.addEventListener("change", updateSpeed);
+else if (motionQuery.addListener) motionQuery.addListener(updateSpeed);
+
+// --- series approximation ---------------------------------------------------
+// d_n = A_n dc + B_n dc^2 + C_n dc^3 + D_n dc^4 + ...  with the recurrences
+//   A' = 2Z A + 1,  B' = 2Z B + A^2,  C' = 2Z C + 2AB,  D' = 2Z D + 2AC + B^2.
+// Skip while the first omitted term (D) is below float32 rounding at the screen
+// corner, and while the orbit stays near the reference (|A R| small).
+const SA_TOL = 1e-7;
+const SA_MAX_LINEAR = 1e-2;
+const sa = { n: 0, a: [0, 0], b: [0, 0], c: [0, 0] };
+function seriesSkip(R, pix) {
+  let ar = 0, ai = 0, br = 0, bi = 0, cr = 0, ci = 0, dr = 0, di = 0;
+  let n = 0, bestAr = 0, bestAi = 0, bestBr = 0, bestBi = 0, bestCr = 0, bestCi = 0;
+  const R4 = R * R * R * R;
+  for (; n < MAX_ITER; n++) {
+    const z = orbit[refIndex(n)];
+    const tr = 2 * z[0], ti = 2 * z[1];
+    const nDr = tr * dr - ti * di + 2 * (ar * cr - ai * ci) + (br * br - bi * bi);
+    const nDi = tr * di + ti * dr + 2 * (ar * ci + ai * cr) + 2 * br * bi;
+    const nCr = tr * cr - ti * ci + 2 * (ar * br - ai * bi);
+    const nCi = tr * ci + ti * cr + 2 * (ar * bi + ai * br);
+    const nBr = tr * br - ti * bi + (ar * ar - ai * ai);
+    const nBi = tr * bi + ti * br + 2 * ar * ai;
+    const nAr = tr * ar - ti * ai + 1;
+    const nAi = tr * ai + ti * ar;
+    const lin = Math.hypot(nAr, nAi) * R;
+    if (lin > SA_MAX_LINEAR || Math.hypot(nDr, nDi) * R4 > SA_TOL * lin) break;
+    ar = nAr; ai = nAi; br = nBr; bi = nBi; cr = nCr; ci = nCi; dr = nDr; di = nDi;
+    bestAr = ar; bestAi = ai; bestBr = br; bestBi = bi; bestCr = cr; bestCi = ci;
+  }
+  // Coefficients in pixel units (w = dc / pix), so float32 on the GPU never overflows.
+  const p2 = pix * pix, p3 = p2 * pix;
+  sa.n = n;
+  sa.a[0] = bestAr * pix; sa.a[1] = bestAi * pix;
+  sa.b[0] = bestBr * p2;  sa.b[1] = bestBi * p2;
+  sa.c[0] = bestCr * p3;  sa.c[1] = bestCi * p3;
+}
+
+// --- palettes ---------------------------------------------------------------
+// Each palette has 6 cyclic band colors, an interior color and a filament color.
+const PALETTES = [
+  { stops: ["#3a0080", "#8b00ff", "#ff00ff", "#ff00b3", "#00ffff", "#00b3ff"], ink: "#12002b", lace: "#ffffff" },
+  { stops: ["#101830", "#1f6f78", "#9fd8cb", "#f2a65a", "#c8553d", "#4a2545"], ink: "#101830", lace: "#f5ede0" },
+  { stops: ["#0a0a0a", "#303030", "#707070", "#b8b8b8", "#707070", "#303030"], ink: "#000000", lace: "#ffffff" }
+];
+const FADE_SECONDS = 0.45;
+
+function hexToRgb(h) {
+  return [parseInt(h.slice(1, 3), 16) / 255, parseInt(h.slice(3, 5), 16) / 255, parseInt(h.slice(5, 7), 16) / 255];
+}
+function toFloats(pal, invert) {
+  const out = new Float32Array(24);   // 8 colors: 6 stops, ink, lace
+  [...pal.stops, pal.ink, pal.lace].forEach((hex, k) => {
+    const c = hexToRgb(hex);
+    for (let j = 0; j < 3; j++) out[3 * k + j] = invert ? 1 - c[j] : c[j];
+  });
+  return out;
+}
+// Cycle order: neon, sunset, black and white, then the same three inverted.
+const PALETTE_CYCLE = [
+  toFloats(PALETTES[0], false), toFloats(PALETTES[1], false), toFloats(PALETTES[2], false),
+  toFloats(PALETTES[0], true), toFloats(PALETTES[1], true), toFloats(PALETTES[2], true)
+];
+
+// --- shaders ----------------------------------------------------------------
+const VERT = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FRAG = `#version 300 es
+precision highp float;
+precision highp int;
+
+#define REF_LEN ${L}
+#define PERIOD ${P}
+#define MAX_ITER ${MAX_ITER}
+
+uniform vec2 uRef[REF_LEN];
+uniform vec2 uCenter;      // half of the canvas size, in device pixels
+uniform vec2 uRot;         // camera rotation (cos, sin)
+uniform vec2 uC0;
+uniform float uPix;        // set units per device pixel
+uniform float uCssPerPx;   // CSS pixels per device pixel
+uniform float uBandOffset; // band position of the frame, already reduced to [0, 1)
+uniform float uNoiseSeed;
+uniform float uFade;
+uniform bool uBulb;
+uniform int uSkip;         // iterations done by the series approximation
+uniform int uSkipRef;      // reference index after uSkip iterations
+uniform vec2 uSa, uSb, uSc;
+uniform vec3 uPal[8];      // 6 band colors, interior, filament
+uniform bool uDither;      // false when the present pass adds the dither
+
+out vec4 fragColor;
+
+vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+
+// 1 / |v|, or 0 when |v|^2 is too large, inf or NaN (a derivative that overflowed).
+// The bit test works also when the compiler assumes that no NaN or inf exists.
+float invLength(vec2 v) {
+  float q2 = dot(v, v);
+  bool bad = (floatBitsToUint(q2) & 0x7f800000u) == 0x7f800000u || q2 >= 1.0e30;
+  return bad ? 0.0 : inversesqrt(max(q2, 1.0e-30));
+}
+
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void main() {
+  vec2 q = gl_FragCoord.xy - uCenter;
+  vec2 w = cmul(q, uRot);                // rotated offset, in device pixels (for the series)
+  vec2 dc = cmul(q * uPix, uRot);        // same rounding order as before v1.3.0
+
+  vec3 ink = uPal[6];
+  vec3 col = ink;
+  bool inside = false;
+
+  // Cheap interior test for the main cardioid and period-2 bulb (only at shallow depth).
+  if (uBulb) {
+    vec2 c = uC0 + dc;
+    float x = c.x - 0.25;
+    float qq = x * x + c.y * c.y;
+    if (qq * (qq + x) < 0.25 * c.y * c.y) inside = true;
+    if ((c.x + 1.0) * (c.x + 1.0) + c.y * c.y < 0.0625) inside = true;
+  }
+
+  if (!inside) {
+    // Start after the skipped iterations. dz is the derivative per device pixel.
+    vec2 w2 = cmul(w, w);
+    vec2 d = cmul(uSa, w) + cmul(uSb, w2) + cmul(uSc, cmul(w2, w));
+    vec2 dz = uSa + 2.0 * cmul(uSb, w) + 3.0 * cmul(uSc, w2);
+    int m = uSkipRef;
+    vec2 z = uRef[m] + d;
+    vec2 dPix = vec2(uPix, 0.0);
+    int n = 0;
+    float r2 = 0.0;
+    bool escaped = false;
+
+    for (n = uSkip; n < MAX_ITER; n++) {
+      dz = 2.0 * cmul(z, dz) + dPix;                 // derivative: dz' = 2 z dz + pix
+      d = cmul(d, 2.0 * uRef[m] + d) + dc;           // perturbation: d' = d (2Z + d) + dc
+      m++;
+      if (m >= REF_LEN) m -= PERIOD;
+      z = uRef[m] + d;
+      r2 = dot(z, z);
+      if (r2 > 1.0e6) { escaped = true; break; }
+      if (r2 < dot(d, d)) { d = z; m = 0; }          // rebase when the orbit passes near 0
+    }
+
+    if (escaped) {
+      float r = sqrt(r2);
+      float lr = log(r);
+      float mu = float(n) + 1.0 - log2(lr);
+      float de = r * lr * invLength(dz) * uCssPerPx;   // distance to the set, in CSS pixels
+      float t = fract(mu * (1.0 / 60.0) + uBandOffset) * 6.0;
+      float i = floor(t);
+      float f = t - i;
+      f = f * f * (3.0 - 2.0 * f);
+      int a = int(i);
+      int b = a == 5 ? 0 : a + 1;
+      col = mix(uPal[a], uPal[b], f);
+      col *= 1.0 - 0.45 * exp(-de * (1.0 / 6.0));   // halo
+      col = mix(col, uPal[7], exp(-de * (1.0 / 0.9))); // filament
+    } else {
+      // No escape in MAX_ITER: interior, or exterior too near the set to escape in time.
+      // Inside a bulb the orbit settles, so dz stays small. Just outside the set dz grows
+      // very large. Thus 1/|dz| is an approximate distance: the edge becomes a smooth
+      // filament line, not a random mix of dark and light pixels.
+      float de = invLength(dz) * uCssPerPx;
+      col = mix(ink, uPal[7], exp(-de * (1.0 / 0.9)));
+    }
+  }
+
+  col = mix(ink, col, uFade);
+  if (uDither) col += (hash(gl_FragCoord.xy + uNoiseSeed) - 0.5) / 255.0;
+  fragColor = vec4(col, 1.0);
+}`;
+
+// Present pass: scales the offscreen render (render size <= canvas size) up to the canvas.
+const PRESENT = `#version 300 es
+precision highp float;
+
+uniform sampler2D uTex;
+uniform vec2 uUvScale;     // canvas pixel -> texture coordinate of the render
+uniform vec2 uUvMin;       // centers of the first and last render texels
+uniform vec2 uUvMax;
+uniform float uNoiseSeed;
+
+out vec4 fragColor;
+
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void main() {
+  vec2 uv = clamp(gl_FragCoord.xy * uUvScale, uUvMin, uUvMax);
+  vec3 col = texture(uTex, uv).rgb;
+  col += (hash(gl_FragCoord.xy + uNoiseSeed) - 0.5) / 255.0;
+  fragColor = vec4(col, 1.0);
+}`;
+
+// --- WebGL setup --------------------------------------------------------------
+const canvas = document.getElementById("c");
+const msg = document.getElementById("msg");
+let gl = null, u = {}, up = {};    // uniform locations: fractal pass, present pass
+let fractalProg, presentProg;
+let maxSide = 4096;                // largest canvas side this GPU can draw to
+let fbo = null, fboTex = null, fboW = 0, fboH = 0, fboOk = true, fboLastUse = 0;
+const FBO_RELEASE_MS = 10000;      // free the offscreen texture after this time without use
+let palDirty = true;
+
+function showMessage(text) {
+  msg.textContent = text;
+  msg.style.display = "grid";
+}
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+function link(vs, fs) {
+  const p = gl.createProgram();
+  const a = compile(gl.VERTEX_SHADER, vs), b = compile(gl.FRAGMENT_SHADER, fs);
+  gl.attachShader(p, a);
+  gl.attachShader(p, b);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.detachShader(p, a); gl.deleteShader(a);   // the program keeps what it needs
+  gl.detachShader(p, b); gl.deleteShader(b);
+  return p;
+}
+
+function initGL() {
+  gl = canvas.getContext("webgl2", { antialias: false, depth: false, stencil: false, alpha: false, powerPreference: "high-performance" });
+  if (!gl) return false;
+  const vp = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+  maxSide = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), vp[0], vp[1]);
+  fractalProg = link(VERT, FRAG);
+  presentProg = link(VERT, PRESENT);
+  gl.bindVertexArray(gl.createVertexArray());
+  for (const name of ["uRef", "uCenter", "uRot", "uC0", "uPix", "uCssPerPx", "uBandOffset", "uNoiseSeed",
+                      "uFade", "uBulb", "uSkip", "uSkipRef", "uSa", "uSb", "uSc", "uPal", "uDither"]) {
+    u[name] = gl.getUniformLocation(fractalProg, name);
+  }
+  for (const name of ["uTex", "uUvScale", "uUvMin", "uUvMax", "uNoiseSeed"]) {
+    up[name] = gl.getUniformLocation(presentProg, name);
+  }
+  gl.useProgram(fractalProg);
+  gl.uniform2fv(u.uRef, new Float32Array(orbit.flat()));
+  gl.uniform2f(u.uC0, C0[0], C0[1]);
+  gl.useProgram(presentProg);
+  gl.uniform1i(up.uTex, 0);
+  fbo = fboTex = null;             // objects of a lost context are gone
+  fboW = fboH = 0;
+  fboOk = true;
+  palDirty = true;
+  return true;
+}
+
+// Offscreen target for renders below full size, exactly w x h. The canvas keeps its
+// size, so a change of render size never reallocates the canvas (that causes a hitch).
+function ensureFbo(w, h) {
+  if (fbo && fboW === w && fboH === h) return fboOk;
+  if (!fbo) {
+    fbo = gl.createFramebuffer();
+    fboTex = gl.createTexture();
+  }
+  gl.bindTexture(gl.TEXTURE_2D, fboTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fboTex, 0);
+  fboOk = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  fboW = w;
+  fboH = h;
+  return fboOk;
+}
+
+function releaseFbo() {
+  if (!fbo) return;
+  gl.deleteFramebuffer(fbo);
+  gl.deleteTexture(fboTex);
+  fbo = fboTex = null;
+  fboW = fboH = 0;
+}
+
+// Fractal pass into the bound framebuffer, at render size rw x rh.
+function drawFractal(ph, rw, rh, t, dither) {
+  gl.useProgram(fractalProg);
+  gl.viewport(0, 0, rw, rh);
+  if (palDirty) {
+    gl.uniform3fv(u.uPal, palNow);
+    palDirty = false;
+  }
+  const scale = S0 * Math.pow(RHO_ABS, -ph);
+  const pix = scale / (Math.min(rw, rh) / 2);
+  const angle = ANGLE_PER_PHASE * ph;
+  const bandOffset = t / 120 - P * ph / 60;
+  seriesSkip(pix * Math.hypot(rw / 2, rh / 2), pix);
+
+  gl.uniform2f(u.uCenter, rw / 2, rh / 2);
+  gl.uniform1f(u.uCssPerPx, cssW / rw);
+  gl.uniform2f(u.uRot, Math.cos(angle), Math.sin(angle));
+  gl.uniform1f(u.uPix, pix);
+  gl.uniform1f(u.uBandOffset, bandOffset - Math.floor(bandOffset));
+  gl.uniform1f(u.uNoiseSeed, (t * 8.333) % 1000);
+  gl.uniform1f(u.uFade, Math.min(1, t / 1.5));
+  gl.uniform1i(u.uBulb, scale > BULB_TEST_SCALE ? 1 : 0);
+  gl.uniform1i(u.uSkip, sa.n);
+  gl.uniform1i(u.uSkipRef, refIndex(sa.n));
+  gl.uniform2f(u.uSa, sa.a[0], sa.a[1]);
+  gl.uniform2f(u.uSb, sa.b[0], sa.b[1]);
+  gl.uniform2f(u.uSc, sa.c[0], sa.c[1]);
+  gl.uniform1i(u.uDither, dither ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// Scale the offscreen render (rw x rh, top-left part of the texture) up to the W x H canvas.
+function present(rw, rh, W, H, t) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.useProgram(presentProg);
+  gl.viewport(0, 0, W, H);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fboTex);
+  gl.uniform2f(up.uUvScale, rw / W / fboW, rh / H / fboH);
+  gl.uniform2f(up.uUvMin, 0.5 / fboW, 0.5 / fboH);
+  gl.uniform2f(up.uUvMax, (rw - 0.5) / fboW, (rh - 0.5) / fboH);
+  gl.uniform1f(up.uNoiseSeed, (t * 8.333) % 1000);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function clearToInk() {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+  gl.clearColor(palNow[18], palNow[19], palNow[20], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+}
+
+// --- palettes ---------------------------------------------------------------
+// palFrom is the palette at the start of a fade, palTo is the next one. palNow is on screen.
+let paletteIndex = 0;
+let palFrom = PALETTE_CYCLE[0], palTo = PALETTE_CYCLE[0];
+const palNow = PALETTE_CYCLE[0].slice();
+let mixValue = 1;
+
+function nextPalette() {
+  palFrom = palNow.slice();           // freeze the colors now on screen
+  paletteIndex = (paletteIndex + 1) % PALETTE_CYCLE.length;
+  palTo = PALETTE_CYCLE[paletteIndex];
+  mixValue = 0;
+  const ink = Array.from(palTo.subarray(18, 21), (v) => Math.round(v * 255));
+  document.body.style.background = `rgb(${ink[0]}, ${ink[1]}, ${ink[2]})`;
+}
+
+function stepPalette(dt) {
+  if (mixValue >= 1) return;
+  mixValue = Math.min(1, mixValue + dt / FADE_SECONDS);
+  for (let i = 0; i < 24; i++) palNow[i] = palFrom[i] + (palTo[i] - palFrom[i]) * mixValue;
+  palDirty = true;
+}
+
+// --- canvas size ----------------------------------------------------------------
+// The canvas has the full device-pixel size (DPR capped at 2), with two more limits:
+// at most MAX_CANVAS_PIXELS (memory and GPU time on very large screens), and no side
+// longer than the GPU can draw (a larger canvas gets a smaller drawing buffer, or no
+// WebGL context at all). The render size below it comes from the plan and the controller.
+const MAX_DPR = 2;
+const MAX_CANVAS_PIXELS = 3840 * 2160;
+let cssW = window.innerWidth, cssH = window.innerHeight;
+let devicePx = null;             // exact device-pixel size from ResizeObserver, when the browser gives it
+
+function applySize() {
+  let dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+  dpr = Math.min(dpr, Math.sqrt(MAX_CANVAS_PIXELS / (cssW * cssH)), maxSide / cssW, maxSide / cssH);
+  let fullW = cssW * dpr, fullH = cssH * dpr;
+  // Use the exact device-pixel size only when it agrees with CSS size x DPR (it removes rounding blur).
+  if (devicePx && Math.abs(devicePx[0] - fullW) <= 1.5 && Math.abs(devicePx[1] - fullH) <= 1.5) {
+    fullW = devicePx[0];
+    fullH = devicePx[1];
+  }
+  const w = Math.min(maxSide, Math.max(1, Math.round(fullW)));
+  const h = Math.min(maxSide, Math.max(1, Math.round(fullH)));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;              // this clears the canvas ...
+    canvas.height = h;
+    render();                      // ... so draw again now, or the browser shows a black frame
+  }
+}
+
+function measureFromLayout() {
+  const rect = canvas.getBoundingClientRect();
+  cssW = Math.max(1, rect.width || window.innerWidth);
+  cssH = Math.max(1, rect.height || window.innerHeight);
+  applySize();
+}
+
+// Size changes arrive as events only; the frame loop reads no layout.
+if (window.ResizeObserver) {
+  const ro = new ResizeObserver((entries) => {
+    const e = entries[entries.length - 1];
+    cssW = Math.max(1, e.contentRect.width);
+    cssH = Math.max(1, e.contentRect.height);
+    const dp = e.devicePixelContentBoxSize && e.devicePixelContentBoxSize[0];
+    devicePx = dp ? [dp.inlineSize, dp.blockSize] : null;
+    applySize();
+  });
+  try { ro.observe(canvas, { box: "device-pixel-content-box" }); } catch (err) { ro.observe(canvas); }
+}
+window.addEventListener("resize", measureFromLayout);
+window.addEventListener("orientationchange", measureFromLayout);
+// A DPR change (window moved to another screen, browser zoom) can come without a resize event.
+// Each query matches one DPR value, so the page removes the old listener and adds a new one.
+(function watchDpr() {
+  const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+  const onChange = () => {
+    if (mq.removeEventListener) mq.removeEventListener("change", onChange);
+    else if (mq.removeListener) mq.removeListener(onChange);
+    measureFromLayout();
+    watchDpr();
+  };
+  if (mq.addEventListener) mq.addEventListener("change", onChange);
+  else if (mq.addListener) mq.addListener(onChange);
+})();
+
+// --- start-up benchmark -----------------------------------------------------------
+// Before the animation starts, time the fractal pass on this GPU at points along the
+// zoom (offscreen, quarter size, on a dark screen). The result is GPU time per pixel
+// for each phase. The frame loop uses it to lower the render size BEFORE a heavy part
+// of the zoom (the intro at phase 1.5 to 3.5 costs up to 3x the loop band), not after
+// frames drop. It runs again after a context loss, because the GPU can change then.
+const BENCH_PHASES = [0, 0.5, 1, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3, 3.25, 3.5, 4, 5, 6, 7.5, 9, 11, 13, 14.9];
+const BENCH_FRAME_MS = 30;       // benchmark work per animation frame
+const bench = { done: false, step: 0, overhead: Infinity, msPerPx: new Float64Array(BENCH_PHASES.length) };
+const syncPx = new Uint8Array(4);
+
+function resetBenchmark() {
+  bench.done = false;
+  bench.step = 0;
+  bench.overhead = Infinity;
+  bench.msPerPx.fill(0);
+}
+
+// Some browsers make the timer coarse (for privacy). Then the timing is not usable,
+// and the page uses only the frame-time feedback. Returns the timer step in ms.
+function timerStepMs() {
+  const limit = Date.now() + 20;
+  let t0 = performance.now(), step = Infinity;
+  for (let k = 0; k < 3 && Date.now() < limit; ) {
+    const t1 = performance.now();
+    if (t1 !== t0) { step = Math.min(step, t1 - t0); t0 = t1; k++; }
+  }
+  return step;
+}
+
+function syncGpu() {
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, syncPx);   // waits until the GPU is done
+}
+
+function timedDraw(ph, w, h) {
+  syncGpu();
+  const t0 = performance.now();
+  drawFractal(ph, w, h, 10, false);
+  syncGpu();
+  return performance.now() - t0;
+}
+
+function runBenchmark() {
+  const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+  const bw = Math.max(1, Math.round(W / 2)), bh = Math.max(1, Math.round(H / 2));
+  if (bench.step === 0 && timerStepMs() > 2) { bench.done = true; return; }
+  if (!ensureFbo(bw, bh)) { bench.done = true; return; }   // no offscreen target: feedback only
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  const t0 = performance.now();
+  while (!bench.done && performance.now() - t0 < BENCH_FRAME_MS) {
+    const s = bench.step++;
+    if (s < 3) {
+      bench.overhead = Math.min(bench.overhead, timedDraw(0, 1, 1));   // fixed cost of one timed draw
+    } else if (s < 5) {
+      timedDraw(2.5, bw, bh);                                          // raise the GPU clock first
+    } else {
+      const i = s - 5;
+      const ms = Math.min(timedDraw(BENCH_PHASES[i], bw, bh), timedDraw(BENCH_PHASES[i], bw, bh));
+      bench.msPerPx[i] = Math.max(0, ms - bench.overhead) / (bw * bh);
+      if (i === BENCH_PHASES.length - 1) bench.done = true;
+    }
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// Render scale that keeps the GPU time of one frame near BUDGET_MS.
+// It looks 0.1 phase (about 0.7 s) ahead, so the size goes down before the cost goes up.
+const BUDGET_MS = 11;
+function costPerPx(ph) {
+  let i = 0;
+  while (i < BENCH_PHASES.length - 2 && ph > BENCH_PHASES[i + 1]) i++;
+  const p0 = BENCH_PHASES[i], p1 = BENCH_PHASES[i + 1];
+  const f = Math.min(1, Math.max(0, (ph - p0) / (p1 - p0)));
+  return bench.msPerPx[i] + (bench.msPerPx[i + 1] - bench.msPerPx[i]) * f;
+}
+function planScale(ph, W, H) {
+  const ahead = Math.min(ph + 0.1, LOOP_START + LOOP_CYCLES - 0.001);
+  const ms = Math.max(costPerPx(ph), costPerPx(ahead)) * W * H;
+  return ms <= BUDGET_MS ? 1 : Math.sqrt(BUDGET_MS / ms);
+}
+
+// --- adaptive quality (feedback) --------------------------------------------------
+// Corrects the plan with the measured time between drawn frames. Too slow: lower the
+// quality factor. Fast: raise it slowly. If two lower sizes give no gain, the display or
+// a power mode limits the rate (for example 30 fps), so the page puts the factor back.
+// The factor goes above 1 only after the intro (it can undo a benchmark that read low).
+const Q_MIN = 0.35, S_MIN = 0.3, WINDOW = 20, INTRO_END = 5;
+const SLOW_MS = 1000 / 48, FAST_MS = 1000 / 56;
+const intervals = new Float32Array(WINDOW), sorted = new Float32Array(WINDOW);
+let quality = 1, lastScale = 1;
+let nIntervals = 0, goodWindows = 0;
+let trial = null;          // { quality, median, steps } while lower factors are on trial
+let lockedMs = 0;          // frame time that the display or power mode sets
+let ceiling = 2, ceilingUntil = 0;
+let holdMs = 30000, lastSlowAt = -Infinity;
+
+function adapt(ms, now) {
+  intervals[nIntervals++] = ms;
+  if (nIntervals < WINDOW) return;
+  nIntervals = 0;
+  sorted.set(intervals);
+  const median = sorted.sort()[WINDOW >> 1];
+  if (now > ceilingUntil) ceiling = 2;
+
+  if (lockedMs) {
+    if (median > lockedMs * 0.8 && median < lockedMs * 1.25) return;
+    lockedMs = 0;
+  }
+  if (median > SLOW_MS) {
+    goodWindows = 0;
+    if (trial) {
+      if (median < trial.median * 0.92) trial = null;                // the last step helped
+      else if (trial.steps >= 2) {                                   // two steps, no gain
+        lockedMs = median;
+        quality = trial.quality;
+        trial = null;
+        return;
+      }
+    }
+    if (quality > Q_MIN) {
+      if (!trial) trial = { quality, median, steps: 0 };
+      trial.steps++;
+      // Stay one raise step below this factor. If it is too slow again soon, wait longer next time.
+      holdMs = now - lastSlowAt < 2 * holdMs ? Math.min(2 * holdMs, 600000) : 30000;
+      lastSlowAt = now;
+      ceiling = quality / 1.06;
+      ceilingUntil = now + holdMs;
+      quality = Math.max(Q_MIN, quality * 0.88);
+    }
+  } else {
+    trial = null;
+    const qMax = Math.min(ceiling, phase < INTRO_END ? 1 : 2);
+    if (median < FAST_MS && lastScale < 1 && quality < qMax) {
+      if (++goodWindows >= 3) {
+        goodWindows = 0;
+        quality = Math.min(qMax, quality * 1.06);
+      }
+    } else {
+      goodWindows = 0;
+    }
+  }
+}
+
+// --- frame loop -----------------------------------------------------------------
+// Frame cap: displays faster than about 110 Hz draw every second or third refresh.
+const MIN_FRAME_MS = 9.0;
+let phase = 0;
+let animTime = 0;          // seconds of animation; it does not jump when the tab was hidden
+let lastRender = performance.now();
+let lastMove = 0, idle = false;
+
+// Draw the current state (no time step). Also used right after a resize.
+function render() {
+  if (!gl || gl.isContextLost()) return;
+  if (!bench.done) { clearToInk(); return; }
+  const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+  let s = Math.max(S_MIN, Math.min(1, quality * planScale(phase, W, H)));
+  if (s > 0.95) s = 1;       // no switch between sharp and almost-sharp from frame to frame
+  if (s < 1) {
+    const rw = Math.max(1, Math.round(W * s)), rh = Math.max(1, Math.round(H * s));
+    if (ensureFbo(W, H)) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      drawFractal(phase, rw, rh, animTime, false);
+      present(rw, rh, W, H, animTime);
+      fboLastUse = lastRender;
+      lastScale = s;
+      return;
+    }
+    s = 1;                   // no offscreen target on this GPU: draw at full size
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  drawFractal(phase, W, H, animTime, true);
+  lastScale = 1;
+  if (fbo && lastRender - fboLastUse > FBO_RELEASE_MS) releaseFbo();
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!gl || gl.isContextLost()) return;
+  if (!bench.done) {
+    runBenchmark();
+    clearToInk();
+    if (bench.done) lastRender = now;   // the animation starts with the next frame
+    return;
+  }
+  const rawMs = now - lastRender;
+  if (rawMs < MIN_FRAME_MS) return;
+  lastRender = now;
+  const dt = Math.min(0.1, rawMs / 1000);
+
+  animTime += dt;
+  phase += dt * PHASE_PER_SEC;
+  // Invisible step back across the self-similar band.
+  if (phase >= LOOP_START + LOOP_CYCLES) phase -= LOOP_CYCLES;
+  stepPalette(dt);
+  render();
+
+  if (rawMs < 250) adapt(rawMs, now);
+
+  // Hide the cursor 2 s after the last mouse movement.
+  if (lastMove && !idle && now - lastMove > 2000) {
+    idle = true;
+    document.body.classList.add("idle");
+  }
+}
+
+// --- context loss -------------------------------------------------------------------
+// The browser can take the GPU away (driver reset, GPU switch, too many contexts).
+// Keep the page, wait for the restore, then build everything again and time the new GPU.
+let lostTimer = 0;
+canvas.addEventListener("webglcontextlost", (e) => {
+  e.preventDefault();
+  lostTimer = setTimeout(() => showMessage("The GPU stopped this animation. Reload the page to start it again."), 5000);
+});
+canvas.addEventListener("webglcontextrestored", () => {
+  clearTimeout(lostTimer);
+  msg.style.display = "none";
+  try {
+    initGL();
+    resetBenchmark();
+  } catch (err) {
+    showMessage("This animation could not start on this GPU. Reload the page to try again.");
+    console.error(err);
+  }
+});
+
+// --- input ------------------------------------------------------------------------
+// A tap or a click changes the palette: one primary pointer, small movement, short press.
+// A drag, a long press or a gesture with two fingers does not.
+let tap = null;
+window.addEventListener("pointerdown", (e) => {
+  tap = e.isPrimary && (e.pointerType !== "mouse" || e.button === 0)
+    ? { id: e.pointerId, x: e.clientX, y: e.clientY, t: e.timeStamp }
+    : null;
+});
+window.addEventListener("pointerup", (e) => {
+  if (!tap || e.pointerId !== tap.id) return;
+  const moved = Math.hypot(e.clientX - tap.x, e.clientY - tap.y);
+  const held = e.timeStamp - tap.t;
+  tap = null;
+  if (moved < 12 && held < 800) nextPalette();
+});
+window.addEventListener("pointercancel", () => { tap = null; });
+
+// Space or Enter changes the palette. F toggles full screen. Key repeat and
+// shortcuts with Ctrl, Cmd or Alt (for example Cmd+F) do nothing here.
+function toggleFullscreen() {
+  const d = document, el = d.documentElement;
+  const done = (p) => { if (p && p.catch) p.catch(() => {}); };   // a refusal is not an error here
+  if (d.fullscreenElement || d.webkitFullscreenElement) {
+    const exit = d.exitFullscreen || d.webkitExitFullscreen;
+    if (exit) done(exit.call(d));
+  } else {
+    const req = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (req) done(req.call(el));
+  }
+}
+window.addEventListener("keydown", (e) => {
+  if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === "f" || e.key === "F") { toggleFullscreen(); return; }
+  if (e.key === " " || e.key === "Enter") { e.preventDefault(); nextPalette(); }
+});
+window.addEventListener("mousemove", () => {
+  lastMove = performance.now();
+  if (idle) {
+    idle = false;
+    document.body.classList.remove("idle");
+  }
+});
+
+// --- start ----------------------------------------------------------------------------
+try {
+  if (initGL()) {
+    document.body.style.background = PALETTES[0].ink;
+    measureFromLayout();
+    requestAnimationFrame(frame);
+  } else {
+    showMessage("This animation needs WebGL 2. Turn on hardware acceleration in your browser settings, then reload the page.");
+  }
+} catch (err) {
+  showMessage("This animation could not start on this GPU. Reload the page to try again.");
+  console.error(err);
+}
+</script>
+</body>
+</html>
