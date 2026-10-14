@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Mandelbrot zoom v1.6.0</title>
+<title>Mandelbrot zoom v1.7.0</title>
 <style>
   html, body {
     margin: 0;
@@ -42,7 +42,7 @@
 
 <script>
 /*
-  Mandelbrot zoom v1.6.0 — fully offline, no network calls.
+  Mandelbrot zoom v1.7.0 — fully offline, no network calls.
 
   Click or tap the page to change the color palette. The order is:
   neon, sunset, black and white, neon inverted, sunset inverted,
@@ -108,6 +108,17 @@
     If no restore comes, a message tells the user to reload.
   - Taps: one finger, small movement, short press. Keys: no repeat, no shortcuts.
   - Derivative overflow check that fast-math compilers cannot remove.
+
+  Cross-browser (v1.7.0):
+  - Fences limit the frames that wait on the GPU to 2. Firefox on Android can call
+    requestAnimationFrame before the GPU is done; then frames queued up and the page
+    froze, while the frame times looked normal.
+  - The controller also sees very slow frames (before, frames > 250 ms were ignored
+    as pauses), and as a last step it lowers the iteration limit.
+  - The start-up timing has limits: a probe sets the test size, at most 12 ms of
+    timed work per frame, at most 2 s in total.
+  - Shaders compile without blocking the page (KHR_parallel_shader_compile).
+  - The shader loop has a constant bound. Repeated GPU losses start a safe mode.
 */
 
 const C0 = [-0.7410964787817876, 0.1895294145054434];
@@ -247,6 +258,7 @@ uniform int uSkipRef;      // reference index after uSkip iterations
 uniform vec2 uSa, uSb, uSc;
 uniform vec3 uPal[8];      // 6 band colors, interior, filament
 uniform bool uDither;      // false when the present pass adds the dither
+uniform int uIterLimit;    // iteration limit (MAX_ITER, lower only on a very slow GPU)
 
 out vec4 fragColor;
 
@@ -290,11 +302,14 @@ void main() {
     int m = uSkipRef;
     vec2 z = uRef[m] + d;
     vec2 dPix = vec2(uPix, 0.0);
-    int n = 0;
+    int n = uSkip;
     float r2 = 0.0;
     bool escaped = false;
 
-    for (n = uSkip; n < MAX_ITER; n++) {
+    // The loop has a constant bound (the most portable form for mobile GPU drivers).
+    // n counts the real iterations, from uSkip up to uIterLimit.
+    for (int k = 0; k < MAX_ITER; k++) {
+      if (n >= uIterLimit) break;
       dz = 2.0 * cmul(z, dz) + dPix;                 // derivative: dz' = 2 z dz + pix
       d = cmul(d, 2.0 * uRef[m] + d) + dc;           // perturbation: d' = d (2Z + d) + dc
       m++;
@@ -303,6 +318,7 @@ void main() {
       r2 = dot(z, z);
       if (r2 > 1.0e6) { escaped = true; break; }
       if (r2 < dot(d, d)) { d = z; m = 0; }          // rebase when the orbit passes near 0
+      n++;
     }
 
     if (escaped) {
@@ -362,6 +378,8 @@ const canvas = document.getElementById("c");
 const msg = document.getElementById("msg");
 let gl = null, u = {}, up = {};    // uniform locations: fractal pass, present pass
 let fractalProg, presentProg;
+let parallelCompile = null;        // KHR_parallel_shader_compile, when the browser has it
+let programsReady = false;
 let maxSide = 4096;                // largest canvas side this GPU can draw to
 let fbo = null, fboTex = null, fboW = 0, fboH = 0, fboOk = true, fboLastUse = 0;
 const FBO_RELEASE_MS = 10000;      // free the offscreen texture after this time without use
@@ -380,28 +398,43 @@ function compile(type, src) {
   return s;
 }
 
-function link(vs, fs) {
+// Start a link. The result is checked later (finishProgram), so a slow driver compile
+// does not block the page when the browser can compile in parallel.
+function startProgram(vs, fs) {
   const p = gl.createProgram();
-  const a = compile(gl.VERTEX_SHADER, vs), b = compile(gl.FRAGMENT_SHADER, fs);
+  const a = gl.createShader(gl.VERTEX_SHADER), b = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(a, vs);
+  gl.shaderSource(b, fs);
+  gl.compileShader(a);
+  gl.compileShader(b);
   gl.attachShader(p, a);
   gl.attachShader(p, b);
   gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
-  gl.detachShader(p, a); gl.deleteShader(a);   // the program keeps what it needs
-  gl.detachShader(p, b); gl.deleteShader(b);
+  p.shaders = [a, b];
   return p;
 }
 
-function initGL() {
-  gl = canvas.getContext("webgl2", { antialias: false, depth: false, stencil: false, alpha: false, powerPreference: "high-performance" });
-  if (!gl) return false;
-  const vp = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
-  maxSide = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), vp[0], vp[1]);
-  fractalProg = link(VERT, FRAG);
-  presentProg = link(VERT, PRESENT);
-  gl.bindVertexArray(gl.createVertexArray());
+function finishProgram(p) {
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    const log = p.shaders.map((s) => gl.getShaderInfoLog(s)).join("\n") + gl.getProgramInfoLog(p);
+    throw new Error(log);
+  }
+  for (const s of p.shaders) { gl.detachShader(p, s); gl.deleteShader(s); }   // the program keeps what it needs
+  p.shaders = [];
+}
+
+// True when both programs are linked. With KHR_parallel_shader_compile this never waits.
+function checkPrograms() {
+  if (programsReady) return true;
+  if (parallelCompile) {
+    for (const p of [fractalProg, presentProg]) {
+      if (!gl.getProgramParameter(p, parallelCompile.COMPLETION_STATUS_KHR)) return false;
+    }
+  }
+  finishProgram(fractalProg);
+  finishProgram(presentProg);
   for (const name of ["uRef", "uCenter", "uRot", "uC0", "uPix", "uCssPerPx", "uBandOffset", "uNoiseSeed",
-                      "uFade", "uBulb", "uSkip", "uSkipRef", "uSa", "uSb", "uSc", "uPal", "uDither"]) {
+                      "uFade", "uBulb", "uSkip", "uSkipRef", "uSa", "uSb", "uSc", "uPal", "uDither", "uIterLimit"]) {
     u[name] = gl.getUniformLocation(fractalProg, name);
   }
   for (const name of ["uTex", "uUvScale", "uUvMin", "uUvMax", "uNoiseSeed"]) {
@@ -412,7 +445,22 @@ function initGL() {
   gl.uniform2f(u.uC0, C0[0], C0[1]);
   gl.useProgram(presentProg);
   gl.uniform1i(up.uTex, 0);
-  fbo = fboTex = null;             // objects of a lost context are gone
+  programsReady = true;
+  return true;
+}
+
+function initGL() {
+  gl = canvas.getContext("webgl2", { antialias: false, depth: false, stencil: false, alpha: false, powerPreference: "high-performance" });
+  if (!gl) return false;
+  const vp = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+  maxSide = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), vp[0], vp[1]);
+  parallelCompile = gl.getExtension("KHR_parallel_shader_compile");
+  programsReady = false;
+  fractalProg = startProgram(VERT, FRAG);
+  presentProg = startProgram(VERT, PRESENT);
+  gl.bindVertexArray(gl.createVertexArray());
+  fences.length = 0;               // fences, FBO and programs of a lost context are gone
+  fbo = fboTex = null;
   fboW = fboH = 0;
   fboOk = true;
   palDirty = true;
@@ -478,6 +526,7 @@ function drawFractal(ph, rw, rh, t, dither) {
   gl.uniform2f(u.uSb, sa.b[0], sa.b[1]);
   gl.uniform2f(u.uSc, sa.c[0], sa.c[1]);
   gl.uniform1i(u.uDither, dither ? 1 : 0);
+  gl.uniform1i(u.uIterLimit, iterLimit);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
@@ -525,6 +574,33 @@ function stepPalette(dt) {
   palDirty = true;
 }
 
+// --- GPU backpressure ------------------------------------------------------------
+// Some browsers (Firefox on Android, for example) call requestAnimationFrame again
+// before the GPU has finished the last frame. Then heavy frames queue up on the GPU:
+// the page and the browser stop responding, and frame times look normal, so the
+// controller does nothing. A fence after each frame shows when the GPU is done.
+// The page draws a new frame only while at most MAX_IN_FLIGHT frames wait on the GPU.
+const MAX_IN_FLIGHT = 2;
+const FENCE_GIVE_UP_MS = 3000;     // a driver that never signals must not stop the page
+const fences = [];                 // { sync, t } in submit order
+
+function gpuBusy(now) {
+  while (fences.length) {
+    const f = fences[0];
+    const done = gl.getSyncParameter(f.sync, gl.SYNC_STATUS) === gl.SIGNALED;
+    if (!done && now - f.t < FENCE_GIVE_UP_MS) break;
+    gl.deleteSync(f.sync);
+    fences.shift();
+  }
+  return fences.length >= MAX_IN_FLIGHT;
+}
+
+function addFence(now) {
+  const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+  if (sync) fences.push({ sync, t: now });
+  gl.flush();                      // send the frame to the GPU now
+}
+
 // --- canvas size ----------------------------------------------------------------
 // The canvas has the full device-pixel size (DPR capped at 2), with two more limits:
 // at most MAX_CANVAS_PIXELS (memory and GPU time on very large screens), and no side
@@ -549,7 +625,12 @@ function applySize() {
   if (canvas.width !== w || canvas.height !== h) {
     canvas.width = w;              // this clears the canvas ...
     canvas.height = h;
-    render();                      // ... so draw again now, or the browser shows a black frame
+    // ... so draw again now, or the browser shows a black frame. If the GPU is still
+    // busy, fill with the interior color (cheap) and do not add to the queue.
+    if (gl && !gl.isContextLost()) {
+      if (ready() && !gpuBusy(performance.now())) render(performance.now());
+      else clearToInk();
+    }
   }
 }
 
@@ -590,13 +671,19 @@ window.addEventListener("orientationchange", measureFromLayout);
 
 // --- start-up benchmark -----------------------------------------------------------
 // Before the animation starts, time the fractal pass on this GPU at points along the
-// zoom (offscreen, quarter size, on a dark screen). The result is GPU time per pixel
-// for each phase. The frame loop uses it to lower the render size BEFORE a heavy part
-// of the zoom (the intro at phase 1.5 to 3.5 costs up to 3x the loop band), not after
-// frames drop. It runs again after a context loss, because the GPU can change then.
+// zoom (offscreen, on a dark screen). The result is GPU time per pixel for each phase.
+// The frame loop uses it to lower the render size BEFORE a heavy part of the zoom (the
+// intro at phase 1.5 to 3.5 costs up to 3x the loop band), not after frames drop.
+// Limits, so that a slow GPU cannot freeze the page:
+// - A first probe sets the test size, so that one timed draw takes about 6 ms.
+// - Each animation frame does at most 12 ms of timed work, then gives the page back.
+// - After 2 s in total, or one timed draw longer than 250 ms, the test stops. The
+//   phases it did not reach get the highest cost it measured.
+// It runs again after a context loss, because the GPU can change then.
 const BENCH_PHASES = [0, 0.5, 1, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3, 3.25, 3.5, 4, 5, 6, 7.5, 9, 11, 13, 14.9];
-const BENCH_FRAME_MS = 30;       // benchmark work per animation frame
-const bench = { done: false, step: 0, overhead: Infinity, msPerPx: new Float64Array(BENCH_PHASES.length) };
+const BENCH_FRAME_MS = 12, BENCH_TOTAL_MS = 2000, BENCH_SLOW_DRAW_MS = 250, BENCH_TARGET_MS = 6;
+const bench = { done: false, step: 0, overhead: Infinity, msPerPx: new Float64Array(BENCH_PHASES.length),
+                measured: 0, bw: 0, bh: 0, spentMs: 0 };
 const syncPx = new Uint8Array(4);
 
 function resetBenchmark() {
@@ -604,6 +691,16 @@ function resetBenchmark() {
   bench.step = 0;
   bench.overhead = Infinity;
   bench.msPerPx.fill(0);
+  bench.measured = 0;
+  bench.spentMs = 0;
+}
+
+function finishBenchmark() {
+  // Phases without a measurement get the highest measured cost (the safe guess).
+  let worst = 0;
+  for (let i = 0; i < bench.measured; i++) worst = Math.max(worst, bench.msPerPx[i]);
+  for (let i = bench.measured; i < BENCH_PHASES.length; i++) bench.msPerPx[i] = worst;
+  bench.done = true;
 }
 
 // Some browsers make the timer coarse (for privacy). Then the timing is not usable,
@@ -632,23 +729,41 @@ function timedDraw(ph, w, h) {
 
 function runBenchmark() {
   const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
-  const bw = Math.max(1, Math.round(W / 2)), bh = Math.max(1, Math.round(H / 2));
-  if (bench.step === 0 && timerStepMs() > 2) { bench.done = true; return; }
-  if (!ensureFbo(bw, bh)) { bench.done = true; return; }   // no offscreen target: feedback only
+  if (bench.step === 0) {
+    if (timerStepMs() > 2) { finishBenchmark(); return; }
+    // Probe: the heaviest intro phase at about 128 x 128 pixels sets the test size.
+    const pw = Math.max(1, Math.round(128 * Math.sqrt(W / H))), ph = Math.max(1, Math.round(128 * Math.sqrt(H / W)));
+    if (!ensureFbo(Math.max(pw, Math.round(W / 2)), Math.max(ph, Math.round(H / 2)))) { finishBenchmark(); return; }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    const ms = timedDraw(2.5, pw, ph);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const k = ms > 0.5 ? Math.sqrt(BENCH_TARGET_MS / ms) : 4;
+    bench.bw = Math.min(fboW, Math.max(16, Math.round(pw * k)));
+    bench.bh = Math.min(fboH, Math.max(16, Math.round(ph * k)));
+    bench.spentMs += ms;
+    bench.step = 1;
+    return;                        // the next frame starts the measurements
+  }
+  const bw = bench.bw, bh = bench.bh;
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   const t0 = performance.now();
   while (!bench.done && performance.now() - t0 < BENCH_FRAME_MS) {
     const s = bench.step++;
-    if (s < 3) {
-      bench.overhead = Math.min(bench.overhead, timedDraw(0, 1, 1));   // fixed cost of one timed draw
-    } else if (s < 5) {
-      timedDraw(2.5, bw, bh);                                          // raise the GPU clock first
+    let ms = 0;
+    if (s <= 3) {
+      ms = timedDraw(0, 1, 1);                                         // fixed cost of one timed draw
+      bench.overhead = Math.min(bench.overhead, ms);
+    } else if (s === 4) {
+      ms = timedDraw(2.5, bw, bh);                                     // raise the GPU clock first
     } else {
       const i = s - 5;
-      const ms = Math.min(timedDraw(BENCH_PHASES[i], bw, bh), timedDraw(BENCH_PHASES[i], bw, bh));
+      ms = timedDraw(BENCH_PHASES[i], bw, bh);
       bench.msPerPx[i] = Math.max(0, ms - bench.overhead) / (bw * bh);
-      if (i === BENCH_PHASES.length - 1) bench.done = true;
+      bench.measured = i + 1;
+      if (i === BENCH_PHASES.length - 1) finishBenchmark();
     }
+    bench.spentMs += ms;
+    if (!bench.done && (ms > BENCH_SLOW_DRAW_MS || bench.spentMs > BENCH_TOTAL_MS)) finishBenchmark();
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
@@ -674,7 +789,11 @@ function planScale(ph, W, H) {
 // quality factor. Fast: raise it slowly. If two lower sizes give no gain, the display or
 // a power mode limits the rate (for example 30 fps), so the page puts the factor back.
 // The factor goes above 1 only after the intro (it can undo a benchmark that read low).
-const Q_MIN = 0.35, S_MIN = 0.3, WINDOW = 20, INTRO_END = 5;
+const Q_MIN = 0.35, S_MIN = 0.25, WINDOW = 20, INTRO_END = 5;
+// Last step for a very slow GPU: fewer iterations per pixel. The edge estimate of
+// v1.5.0 draws the pixels that do not escape in time as a smooth filament line.
+const ITER_MIN = 300, VERY_SLOW_MS = 150;
+let iterLimit = MAX_ITER;
 const SLOW_MS = 1000 / 48, FAST_MS = 1000 / 56;
 const intervals = new Float32Array(WINDOW), sorted = new Float32Array(WINDOW);
 let quality = 1, lastScale = 1;
@@ -685,6 +804,19 @@ let ceiling = 2, ceilingUntil = 0;
 let holdMs = 30000, lastSlowAt = -Infinity;
 
 function adapt(ms, now) {
+  // One frame far too slow: act now, do not wait for a full window.
+  if (ms > VERY_SLOW_MS) {
+    nIntervals = 0;
+    goodWindows = 0;
+    trial = null;
+    lockedMs = 0;
+    lastSlowAt = now;
+    ceiling = Math.min(ceiling, quality / 1.06);
+    ceilingUntil = now + 30000;
+    if (quality > Q_MIN) quality = Math.max(Q_MIN, quality * 0.7);
+    else iterLimit = Math.max(ITER_MIN, Math.round(iterLimit * 0.7));
+    return;
+  }
   intervals[nIntervals++] = ms;
   if (nIntervals < WINDOW) return;
   nIntervals = 0;
@@ -707,6 +839,10 @@ function adapt(ms, now) {
         return;
       }
     }
+    if (quality <= Q_MIN && lastScale <= S_MIN + 0.01 && iterLimit > ITER_MIN) {
+      iterLimit = Math.max(ITER_MIN, Math.round(iterLimit * 0.8));   // smallest size and still slow
+      return;
+    }
     if (quality > Q_MIN) {
       if (!trial) trial = { quality, median, steps: 0 };
       trial.steps++;
@@ -720,10 +856,11 @@ function adapt(ms, now) {
   } else {
     trial = null;
     const qMax = Math.min(ceiling, phase < INTRO_END ? 1 : 2);
-    if (median < FAST_MS && lastScale < 1 && quality < qMax) {
+    if (median < FAST_MS && (iterLimit < MAX_ITER || (lastScale < 1 && quality < qMax))) {
       if (++goodWindows >= 3) {
         goodWindows = 0;
-        quality = Math.min(qMax, quality * 1.06);
+        if (iterLimit < MAX_ITER) iterLimit = Math.min(MAX_ITER, Math.round(iterLimit * 1.15) + 1);   // iterations come back first
+        else quality = Math.min(qMax, quality * 1.06);
       }
     } else {
       goodWindows = 0;
@@ -737,11 +874,26 @@ const MIN_FRAME_MS = 9.0;
 let phase = 0;
 let animTime = 0;          // seconds of animation; it does not jump when the tab was hidden
 let lastRender = performance.now();
+let skipNextInterval = true;       // the first interval after start, a pause or a hidden tab is not a frame time
 let lastMove = 0, idle = false;
 
+let failed = false;
+function ready() {
+  if (programsReady) return true;
+  if (failed) return false;
+  try {
+    return checkPrograms();
+  } catch (err) {
+    failed = true;
+    showMessage("This animation could not start on this GPU. Reload the page to try again.");
+    console.error(err);
+    return false;
+  }
+}
+
 // Draw the current state (no time step). Also used right after a resize.
-function render() {
-  if (!gl || gl.isContextLost()) return;
+function render(now) {
+  if (!gl || gl.isContextLost() || !ready()) return;
   if (!bench.done) { clearToInk(); return; }
   const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
   let s = Math.max(S_MIN, Math.min(1, quality * planScale(phase, W, H)));
@@ -752,8 +904,9 @@ function render() {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       drawFractal(phase, rw, rh, animTime, false);
       present(rw, rh, W, H, animTime);
-      fboLastUse = lastRender;
+      fboLastUse = now;
       lastScale = s;
+      addFence(now);
       return;
     }
     s = 1;                   // no offscreen target on this GPU: draw at full size
@@ -761,20 +914,23 @@ function render() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   drawFractal(phase, W, H, animTime, true);
   lastScale = 1;
-  if (fbo && lastRender - fboLastUse > FBO_RELEASE_MS) releaseFbo();
+  addFence(now);
+  if (fbo && now - fboLastUse > FBO_RELEASE_MS) releaseFbo();
 }
 
 function frame(now) {
   requestAnimationFrame(frame);
   if (!gl || gl.isContextLost()) return;
+  if (!ready()) { clearToInk(); return; }          // shaders still compile
   if (!bench.done) {
     runBenchmark();
     clearToInk();
-    if (bench.done) lastRender = now;   // the animation starts with the next frame
+    if (bench.done) { lastRender = now; skipNextInterval = true; }   // the animation starts with the next frame
     return;
   }
   const rawMs = now - lastRender;
   if (rawMs < MIN_FRAME_MS) return;
+  if (gpuBusy(now)) return;        // the GPU has not finished the last frames: do not queue more
   lastRender = now;
   const dt = Math.min(0.1, rawMs / 1000);
 
@@ -783,9 +939,10 @@ function frame(now) {
   // Invisible step back across the self-similar band.
   if (phase >= LOOP_START + LOOP_CYCLES) phase -= LOOP_CYCLES;
   stepPalette(dt);
-  render();
+  render(now);
 
-  if (rawMs < 250) adapt(rawMs, now);
+  if (skipNextInterval) skipNextInterval = false;
+  else adapt(Math.min(rawMs, 1000), now);
 
   // Hide the cursor 2 s after the last mouse movement.
   if (lastMove && !idle && now - lastMove > 2000) {
@@ -794,11 +951,25 @@ function frame(now) {
   }
 }
 
+// A hidden tab gets no frames. The gap when it comes back is not a slow frame.
+document.addEventListener("visibilitychange", () => { skipNextInterval = true; });
+
 // --- context loss -------------------------------------------------------------------
 // The browser can take the GPU away (driver reset, GPU switch, too many contexts).
 // Keep the page, wait for the restore, then build everything again and time the new GPU.
+// If the GPU is lost again and again (a driver that resets under this load), the page
+// restarts in a safe mode (smaller size, fewer iterations), and after 4 losses in 2
+// minutes it stops and tells the user.
 let lostTimer = 0;
+const lossTimes = [];
 canvas.addEventListener("webglcontextlost", (e) => {
+  const t = performance.now();
+  lossTimes.push(t);
+  while (lossTimes.length && t - lossTimes[0] > 120000) lossTimes.shift();
+  if (lossTimes.length >= 4) {
+    showMessage("The GPU stopped this animation several times. Reload the page to start it again.");
+    return;                        // no preventDefault: the browser does not restore it
+  }
   e.preventDefault();
   lostTimer = setTimeout(() => showMessage("The GPU stopped this animation. Reload the page to start it again."), 5000);
 });
@@ -808,6 +979,10 @@ canvas.addEventListener("webglcontextrestored", () => {
   try {
     initGL();
     resetBenchmark();
+    if (lossTimes.length >= 2) {   // safe mode
+      quality = Math.min(quality, 0.5);
+      iterLimit = Math.min(iterLimit, 600);
+    }
   } catch (err) {
     showMessage("This animation could not start on this GPU. Reload the page to try again.");
     console.error(err);
@@ -863,7 +1038,7 @@ try {
   if (initGL()) {
     document.body.style.background = PALETTES[0].ink;
     measureFromLayout();
-    requestAnimationFrame(frame);
+    requestAnimationFrame(frame);  // shows the interior color until the shaders are ready
   } else {
     showMessage("This animation needs WebGL 2. Turn on hardware acceleration in your browser settings, then reload the page.");
   }
